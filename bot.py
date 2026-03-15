@@ -1,6 +1,9 @@
+import os
 import asyncio
 import sqlite3
-from datetime import datetime, timedelta, timezone
+import threading
+from datetime import datetime, timedelta
+from flask import Flask
 import requests
 
 from aiogram import Bot, Dispatcher, F
@@ -16,21 +19,116 @@ from aiogram.types import (
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
-# =======================
+# =========================
 # CONFIG
-# =======================
-BOT_TOKEN = "8773612925:AAFX4iVsz2TxNiIWZ6C2vtSm2fUJnWtwLgw"
+# =========================
+BOT_TOKEN ="8773612925:AAFX4iVsz2TxNiIWZ6C2vtSm2fUJnWtwLgw"
 FOOT_API_KEY = "21165774b3e849c882766618d3e42cee"
-ADMIN_ID = 5681608229
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5681608229"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003808231751"))
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@pronostics_bilan")
 
-DB_PATH = "bot_v7.db"
 BASE_URL = "https://api.football-data.org/v4"
 LEAGUES = ["PL", "PD", "SA", "BL1", "FL1"]
-VIP_PRICE = "10 000 FCFA / mois"
+DB_NAME = "bot_v16_full.db"
 
+VIP_TEXT = """
+💎 <b>ACCÈS VIP PRONOSTICS</b>
+
+Prix : <b>10 000 FCFA / mois</b>
+
+💳 <b>Paiement Mobile Money</b>
+
+• MTN Money : <b>+225 05 03 04 63 94</b>
+• Orange Money : <b>+225 07 13 88 24 66</b>
+• Moov Money : <b>+225 01 61 38 08 10</b>
+• Wave : <b>+225 07 13 88 24 66</b>
+
+Après paiement :
+1️⃣ Clique sur <b>✅ J’ai payé</b>
+2️⃣ Envoie ta preuve
+3️⃣ L’admin vérifie
+4️⃣ Ton accès VIP est activé
+"""
+
+TRADING_TEXT = """
+📈 <b>SIGNAUX TRADING VIP</b>
+
+XAUUSD BUY
+Entrée : 2945
+SL : 2937
+TP : 2958
+
+BTCUSD SELL
+Entrée : 84250
+TP : 83380
+
+⚠️ Le trading comporte des risques.
+"""
+
+# =========================
+# WEB SERVER (RENDER)
+# =========================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "BOT V16 FULL ONLINE"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# =========================
+# DATABASE
+# =========================
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    created_at TEXT
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS vip(
+    user_id INTEGER PRIMARY KEY,
+    expire TEXT
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT,
+    match_name TEXT,
+    competition TEXT,
+    kickoff TEXT,
+    prediction TEXT,
+    confidence INTEGER,
+    created_at TEXT
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS waiting_proof(
+    user_id INTEGER PRIMARY KEY
+)
+""")
+
+conn.commit()
+
+# =========================
+# BOT
+# =========================
 dp = Dispatcher()
 
-menu = ReplyKeyboardMarkup(
+main_menu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="⚽ Pronostics foot")],
         [KeyboardButton(text="📈 Signaux trading")],
@@ -40,233 +138,77 @@ menu = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-vip_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="✅ J’ai payé", callback_data="i_paid")]
-    ]
-)
-
-# =======================
-# DB
-# =======================
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def init_db():
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        telegram_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        created_at TEXT,
-        last_seen_at TEXT
+def vip_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ J’ai payé", callback_data="paid")],
+            [InlineKeyboardButton(text="📊 Canal bilan", url=f"https://t.me/{CHANNEL_USERNAME.replace('@','')}")]
+        ]
     )
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS vip_users (
-        telegram_id INTEGER PRIMARY KEY,
-        expire_date TEXT
+def admin_proof_keyboard(user_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Valider VIP", callback_data=f"approve_{user_id}"),
+                InlineKeyboardButton(text="❌ Refuser", callback_data=f"reject_{user_id}")
+            ]
+        ]
     )
-    """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS waiting_proof (
-        telegram_id INTEGER PRIMARY KEY,
-        created_at TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER,
-        proof_text TEXT,
-        proof_type TEXT,
-        status TEXT,
-        created_at TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS prediction_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_name TEXT,
-        competition TEXT,
-        kickoff TEXT,
-        prediction TEXT,
-        confidence INTEGER,
-        analysis TEXT,
-        created_at TEXT
-    )
-    """)
-
-    conn.commit()
-    conn.close()
+# =========================
+# HELPERS
+# =========================
+def now_str():
+    return datetime.now().isoformat()
 
 def save_user(message: Message):
-    conn = db()
-    cur = conn.cursor()
     cur.execute("""
-    INSERT OR REPLACE INTO users (telegram_id, username, full_name, created_at, last_seen_at)
-    VALUES (
-        ?,
-        ?,
-        ?,
-        COALESCE((SELECT created_at FROM users WHERE telegram_id = ?), ?),
-        ?
-    )
+    INSERT OR IGNORE INTO users(id, username, full_name, created_at)
+    VALUES (?, ?, ?, ?)
     """, (
         message.from_user.id,
         message.from_user.username or "",
         message.from_user.full_name or "",
-        message.from_user.id,
-        now_iso(),
-        now_iso()
+        now_str()
     ))
     conn.commit()
-    conn.close()
 
 def is_vip(user_id: int) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT expire_date FROM vip_users WHERE telegram_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-
+    row = cur.execute("SELECT expire FROM vip WHERE user_id=?", (user_id,)).fetchone()
     if not row:
         return False
-
     try:
-        expiry = datetime.fromisoformat(row["expire_date"])
-        if expiry.tzinfo is None:
-            expiry = expiry.replace(tzinfo=timezone.utc)
-        return expiry > datetime.now(timezone.utc)
+        return datetime.fromisoformat(row["expire"]) > datetime.now()
     except Exception:
         return False
 
-def get_vip_expiry(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT expire_date FROM vip_users WHERE telegram_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row["expire_date"] if row else None
+def vip_expire(user_id: int):
+    row = cur.execute("SELECT expire FROM vip WHERE user_id=?", (user_id,)).fetchone()
+    return row["expire"] if row else "—"
 
 def activate_vip(user_id: int, days: int = 30):
-    expiry = datetime.now(timezone.utc) + timedelta(days=days)
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT OR REPLACE INTO vip_users (telegram_id, expire_date)
-    VALUES (?, ?)
-    """, (user_id, expiry.isoformat()))
+    expire_date = datetime.now() + timedelta(days=days)
+    cur.execute("INSERT OR REPLACE INTO vip(user_id, expire) VALUES (?, ?)", (user_id, expire_date.isoformat()))
+    cur.execute("DELETE FROM waiting_proof WHERE user_id=?", (user_id,))
     conn.commit()
-    conn.close()
 
-def set_waiting_proof(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT OR REPLACE INTO waiting_proof (telegram_id, created_at)
-    VALUES (?, ?)
-    """, (user_id, now_iso()))
-    conn.commit()
-    conn.close()
-
-def clear_waiting_proof(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM waiting_proof WHERE telegram_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def is_waiting_proof(user_id: int) -> bool:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT telegram_id FROM waiting_proof WHERE telegram_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
+def waiting_proof(user_id: int) -> bool:
+    row = cur.execute("SELECT user_id FROM waiting_proof WHERE user_id=?", (user_id,)).fetchone()
     return row is not None
 
-def add_payment(user_id: int, proof_text: str, proof_type: str):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO payments (telegram_id, proof_text, proof_type, status, created_at)
-    VALUES (?, ?, ?, 'pending', ?)
-    """, (user_id, proof_text, proof_type, now_iso()))
-    conn.commit()
-    conn.close()
+def count_users() -> int:
+    row = cur.execute("SELECT COUNT(*) AS total FROM users").fetchone()
+    return int(row["total"])
 
-def count_users():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM users")
-    row = cur.fetchone()
-    conn.close()
-    return int(row["c"])
-
-def count_vip():
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT expire_date FROM vip_users")
-    rows = cur.fetchall()
-    conn.close()
-
-    total = 0
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        try:
-            expiry = datetime.fromisoformat(row["expire_date"])
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if expiry > now:
-                total += 1
-        except Exception:
-            pass
-    return total
-
-def save_prediction_history(match_name, competition, kickoff, prediction, confidence, analysis):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    INSERT INTO prediction_history (
-        match_name, competition, kickoff, prediction, confidence, analysis, created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (match_name, competition, kickoff, prediction, confidence, analysis, now_iso()))
-    conn.commit()
-    conn.close()
-
-def get_last_predictions(limit=10):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-    SELECT * FROM prediction_history
-    ORDER BY id DESC
-    LIMIT ?
-    """, (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-# =======================
-# FOOT API
-# =======================
+# =========================
+# API FOOT
+# =========================
 def api_get(path, params=None):
     headers = {"X-Auth-Token": FOOT_API_KEY}
-    r = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    response = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=25)
+    response.raise_for_status()
+    return response.json()
 
 def get_standings_map(code):
     data = api_get(f"/competitions/{code}/standings")
@@ -278,91 +220,68 @@ def get_standings_map(code):
     rows = standings[0].get("table", [])
     for row in rows:
         team = row.get("team", {})
-        if team.get("id") and row.get("position"):
-            table[team["id"]] = row["position"]
+        team_id = team.get("id")
+        position = row.get("position")
+        if team_id and position:
+            table[team_id] = position
     return table
 
-# =======================
-# V7 SCORING
-# =======================
-def compute_confidence_and_pick(home_name, away_name, home_pos, away_pos):
+def build_prediction(home_name, away_name, home_pos, away_pos):
     if home_pos is None or away_pos is None:
-        return {
-            "prediction": "Over 1.5 buts",
-            "confidence": 58,
-            "analysis": "Classement indisponible, choix prudent.",
-            "rank_score": 58
-        }
+        return {"prediction": "Over 1.5 buts", "confidence": 58}
 
     diff = away_pos - home_pos
     abs_diff = abs(diff)
 
-    # Base score
-    score = 50 + min(abs_diff * 4, 28)
-
-    # Marché choisi
     if diff >= 8:
         prediction = "1X"
-        analysis = f"{home_name} est largement mieux classé et joue à domicile."
-        score += 10
+        confidence = 82
     elif diff >= 4:
-        prediction = "Victoire ou nul domicile"
-        analysis = f"{home_name} a un avantage sérieux au classement."
-        score += 6
+        prediction = "Victoire domicile ou nul"
+        confidence = 75
     elif diff <= -8:
         prediction = "X2"
-        analysis = f"{away_name} est largement mieux classé malgré le déplacement."
-        score += 10
+        confidence = 80
     elif diff <= -4:
-        prediction = "Victoire ou nul extérieur"
-        analysis = f"{away_name} a un meilleur profil sur le classement."
-        score += 6
+        prediction = "Victoire extérieur ou nul"
+        confidence = 74
     else:
         prediction = "Over 1.5 buts"
-        analysis = "Match plus équilibré, on reste sur un marché prudent."
-        score += 2
+        confidence = 64
 
-    # Petite pénalité si trop équilibré
     if abs_diff <= 1:
-        score -= 8
+        confidence -= 6
     elif abs_diff == 2:
-        score -= 4
+        confidence -= 3
 
-    # Encadrement
-    score = max(55, min(score, 88))
+    confidence = max(55, min(confidence, 88))
+    return {"prediction": prediction, "confidence": confidence}
 
-    return {
-        "prediction": prediction,
-        "confidence": score,
-        "analysis": analysis,
-        "rank_score": score
-    }
-
-def build_predictions():
+def generate_pronos_from_api():
     data = api_get("/matches", params={"competitions": ",".join(LEAGUES)})
     matches = data.get("matches", [])
-
     if not matches:
-        return ["Aucun match trouvé aujourd’hui."]
+        return []
 
     standings_cache = {}
-    scored_matches = []
+    predictions = []
 
     for match in matches:
         if match.get("status") not in ["TIMED", "SCHEDULED"]:
             continue
 
-        comp = match.get("competition", {})
-        code = comp.get("code")
-        comp_name = comp.get("name", "Compétition")
+        competition = match.get("competition", {})
+        code = competition.get("code")
+        competition_name = competition.get("name", "Compétition")
 
         home = match.get("homeTeam", {})
         away = match.get("awayTeam", {})
-        home_id = home.get("id")
-        away_id = away.get("id")
+
         home_name = home.get("name", "Home")
         away_name = away.get("name", "Away")
-        kickoff = match.get("utcDate", "")
+        home_id = home.get("id")
+        away_id = away.get("id")
+        utc_date = match.get("utcDate", "")
 
         if not code:
             continue
@@ -377,290 +296,279 @@ def build_predictions():
         home_pos = standings.get(home_id)
         away_pos = standings.get(away_id)
 
-        result = compute_confidence_and_pick(home_name, away_name, home_pos, away_pos)
+        pred = build_prediction(home_name, away_name, home_pos, away_pos)
 
-        scored_matches.append({
+        predictions.append({
             "match_name": f"{home_name} vs {away_name}",
-            "competition": comp_name,
-            "kickoff": kickoff,
-            "prediction": result["prediction"],
-            "confidence": result["confidence"],
-            "analysis": result["analysis"],
-            "rank_score": result["rank_score"]
+            "competition": competition_name,
+            "kickoff": utc_date,
+            "prediction": pred["prediction"],
+            "confidence": pred["confidence"]
         })
 
-    if not scored_matches:
-        return ["Aucun match exploitable trouvé aujourd’hui."]
+    predictions.sort(key=lambda x: x["confidence"], reverse=True)
+    return predictions[:5]
 
-    # Trier par confiance décroissante
-    scored_matches.sort(key=lambda x: x["rank_score"], reverse=True)
+async def send_pronos(chat_id: int, bot: Bot):
+    try:
+        pronos = await asyncio.to_thread(generate_pronos_from_api)
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Erreur API foot : {e}")
+        return
 
-    # Prendre les 5 meilleurs
-    top = scored_matches[:5]
+    if not pronos:
+        await bot.send_message(chat_id, "⚠️ Aucun match disponible aujourd’hui.")
+        return
 
-    out = []
-    for item in top:
-        save_prediction_history(
+    text = "⚽ <b>PRONOSTICS DU JOUR</b>\n\n"
+
+    for item in pronos:
+        text += (
+            f"<b>{item['match_name']}</b>\n"
+            f"🏆 {item['competition']}\n"
+            f"🕒 {item['kickoff']}\n"
+            f"➡️ {item['prediction']}\n"
+            f"📊 Confiance : {item['confidence']}%\n\n"
+        )
+
+        cur.execute("""
+        INSERT INTO history(date, match_name, competition, kickoff, prediction, confidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().strftime("%Y-%m-%d"),
             item["match_name"],
             item["competition"],
             item["kickoff"],
             item["prediction"],
             item["confidence"],
-            item["analysis"]
-        )
+            now_str()
+        ))
 
-        out.append(
-            f"⚽ <b>{item['match_name']}</b>\n"
-            f"🏆 {item['competition']}\n"
-            f"🕒 {item['kickoff']}\n"
-            f"🎯 Prono : <b>{item['prediction']}</b>\n"
-            f"📊 Confiance : {item['confidence']}%\n"
-            f"🧠 Analyse : {item['analysis']}"
-        )
-
-    return out
-
-async def send_predictions(bot: Bot, chat_id: int):
-    preds = await asyncio.to_thread(build_predictions)
-    text = "⚽ <b>Top 5 pronostics du jour</b>\n\n" + "\n\n".join(preds)
+    conn.commit()
     await bot.send_message(chat_id, text)
 
-# =======================
-# HANDLERS
-# =======================
+async def send_bilan(chat_id: int, bot: Bot):
+    rows = cur.execute("""
+    SELECT * FROM history
+    ORDER BY id DESC
+    LIMIT 5
+    """).fetchall()
+
+    if not rows:
+        await bot.send_message(chat_id, "⚠️ Aucun historique disponible.")
+        return
+
+    text = "📊 <b>BILAN DES DERNIERS PRONOSTICS</b>\n\n"
+    for row in rows:
+        text += (
+            f"<b>{row['match_name']}</b>\n"
+            f"🏆 {row['competition']}\n"
+            f"➡️ {row['prediction']}\n"
+            f"📊 Confiance : {row['confidence']}%\n\n"
+        )
+
+    await bot.send_message(chat_id, text)
+
+# =========================
+# COMMANDS
+# =========================
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     save_user(message)
     await message.answer(
-        "👋 Bienvenue sur <b>PRONOSTIC BOT V7</b>\n\nChoisis une option :",
-        reply_markup=menu
+        "👋 <b>Bienvenue sur PRONOSTIC BOT V16</b>\n\nChoisis une option dans le menu ci-dessous.",
+        reply_markup=main_menu
     )
 
 @dp.message(Command("id"))
 async def id_cmd(message: Message):
     save_user(message)
-    await message.answer(f"Ton ID : <code>{message.chat.id}</code>")
+    await message.answer(f"Ton ID Telegram : <code>{message.from_user.id}</code>")
+
+@dp.message(Command("pronos"))
+async def pronos_cmd(message: Message, bot: Bot):
+    save_user(message)
+    await send_pronos(message.chat.id, bot)
+
+@dp.message(Command("vip"))
+async def vip_cmd(message: Message):
+    save_user(message)
+    await message.answer(VIP_TEXT, reply_markup=vip_keyboard())
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: Message):
     save_user(message)
     if message.from_user.id != ADMIN_ID:
-        await message.answer("Commande réservée à l’admin.")
         return
-
     await message.answer(
-        "📊 <b>Stats bot</b>\n\n"
-        f"Utilisateurs : <b>{count_users()}</b>\n"
-        f"VIP actifs : <b>{count_vip()}</b>"
+        "📊 <b>STATISTIQUES</b>\n\n"
+        f"👥 Utilisateurs : <b>{count_users()}</b>\n"
     )
 
-@dp.message(Command("history"))
-async def history_cmd(message: Message):
+@dp.message(Command("prono"))
+async def prono_admin_cmd(message: Message, bot: Bot):
     save_user(message)
     if message.from_user.id != ADMIN_ID:
-        await message.answer("Commande réservée à l’admin.")
         return
+    await send_pronos(CHANNEL_ID, bot)
+    await message.answer("✅ Pronostics envoyés dans le canal.")
 
-    rows = get_last_predictions(10)
-    if not rows:
-        await message.answer("Aucun historique pour le moment.")
-        return
-
-    text = "📚 <b>Derniers pronostics enregistrés</b>\n\n"
-    for row in rows:
-        text += (
-            f"⚽ {row['match_name']}\n"
-            f"🎯 {row['prediction']} | {row['confidence']}%\n"
-            f"🏆 {row['competition']}\n\n"
-        )
-
-    await message.answer(text)
-
-@dp.message(Command("sendtest"))
-async def sendtest_cmd(message: Message):
+@dp.message(Command("bilan"))
+async def bilan_cmd(message: Message, bot: Bot):
     save_user(message)
     if message.from_user.id != ADMIN_ID:
-        await message.answer("Commande réservée à l’admin.")
         return
+    await send_bilan(CHANNEL_ID, bot)
+    await message.answer("✅ Bilan envoyé dans le canal.")
 
-    try:
-        await send_predictions(message.bot, message.chat.id)
-    except Exception as e:
-        await message.answer(f"❌ Erreur : {e}")
-
-@dp.message(Command("vip"))
-async def vip_admin_cmd(message: Message):
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(message: Message, bot: Bot):
     save_user(message)
     if message.from_user.id != ADMIN_ID:
         return
 
-    try:
-        parts = message.text.split()
-        user_id = int(parts[1])
-        days = int(parts[2]) if len(parts) > 2 else 30
-        activate_vip(user_id, days)
-        clear_waiting_proof(user_id)
-        await message.answer(f"✅ VIP activé pour {user_id} pendant {days} jours.")
-        await message.bot.send_message(user_id, f"🎉 Ton VIP est activé pour {days} jours.")
-    except Exception:
-        await message.answer("Usage : /vip user_id 30")
+    content = message.text.replace("/broadcast", "", 1).strip()
+    if not content:
+        await message.answer("Usage : /broadcast votre message")
+        return
 
+    users = cur.execute("SELECT id FROM users").fetchall()
+    sent = 0
+    for user in users:
+        try:
+            await bot.send_message(user["id"], content)
+            sent += 1
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Message envoyé à {sent} utilisateur(s).")
+
+# =========================
+# BUTTONS
+# =========================
 @dp.message(F.text == "⚽ Pronostics foot")
-async def foot_btn(message: Message):
+async def button_pronos(message: Message, bot: Bot):
     save_user(message)
-    await message.answer("⏳ Analyse des meilleurs matchs du jour...")
-    try:
-        preds = await asyncio.to_thread(build_predictions)
-        await message.answer("⚽ <b>Top 5 pronostics foot</b>\n\n" + "\n\n".join(preds))
-    except Exception as e:
-        await message.answer(f"❌ Erreur API foot : {e}")
-
-@dp.message(F.text == "📈 Signaux trading")
-async def trade_btn(message: Message):
-    save_user(message)
-
-    if not is_vip(message.from_user.id):
-        await message.answer(
-            "🔒 Les signaux trading sont réservés aux VIP.\n\n"
-            "💎 Offre VIP\n"
-            f"Prix : <b>{VIP_PRICE}</b>",
-            reply_markup=vip_keyboard
-        )
-        return
-
-    await message.answer(
-        "📈 <b>Signaux trading VIP</b>\n\n"
-        "1. XAUUSD — BUY\n"
-        "Entrée : 2945\nSL : 2937\nTP : 2958\nTF : M15\n\n"
-        "2. BTCUSD — SELL\n"
-        "Entrée : 84250\nSL : 84720\nTP : 83380\nTF : M15\n\n"
-        "⚠️ Le trading comporte des risques."
-    )
+    await send_pronos(message.chat.id, bot)
 
 @dp.message(F.text == "💎 Offre VIP")
-async def vip_btn(message: Message):
+async def button_vip(message: Message):
     save_user(message)
-
-    if is_vip(message.from_user.id):
-        expiry = get_vip_expiry(message.from_user.id) or "—"
-        await message.answer(f"✅ Tu es déjà VIP.\nExpiration : <code>{expiry}</code>")
-        return
-
-    await message.answer(
-        "💎 <b>OFFRE VIP</b>\n\n"
-        "• Pronostics premium\n"
-        "• Signaux trading VIP\n"
-        "• Alertes prioritaires\n\n"
-        f"Prix : <b>{VIP_PRICE}</b>\n\n"
-        "Paiement :\n"
-        "• MTN Money : <b>225 0503046394</b>\n"
-        "• Orange Money : <b>225 0713882466</b>\n"
-        "• Moov Money : <b>225 0161380810</b>\n"
-        "• Wave : <b>225 0713882466</b>\n\n"
-        "Après paiement, clique sur le bouton ci-dessous.",
-        reply_markup=vip_keyboard
-    )
+    await message.answer(VIP_TEXT, reply_markup=vip_keyboard())
 
 @dp.message(F.text == "👤 Mon compte")
-async def account_btn(message: Message):
+async def button_account(message: Message):
     save_user(message)
-    vip_status = "✅ Actif" if is_vip(message.from_user.id) else "❌ Inactif"
-    expiry = get_vip_expiry(message.from_user.id) or "—"
-    waiting = "Oui" if is_waiting_proof(message.from_user.id) else "Non"
+    status = "✅ Actif" if is_vip(message.from_user.id) else "❌ Inactif"
+    expire = vip_expire(message.from_user.id)
+    proof = "Oui" if waiting_proof(message.from_user.id) else "Non"
 
-    await message.answer(
+    text = (
         "👤 <b>Mon compte</b>\n\n"
         f"ID : <code>{message.from_user.id}</code>\n"
         f"Nom : {message.from_user.full_name}\n"
-        f"VIP : {vip_status}\n"
-        f"Expiration VIP : <code>{expiry}</code>\n"
-        f"Preuve en attente : {waiting}"
+        f"VIP : {status}\n"
+        f"Expiration VIP : {expire}\n"
+        f"Preuve en attente : {proof}"
     )
+    await message.answer(text)
 
-# =======================
+@dp.message(F.text == "📈 Signaux trading")
+async def button_trading(message: Message):
+    save_user(message)
+    if not is_vip(message.from_user.id):
+        await message.answer(
+            "🔒 Les signaux trading sont réservés aux VIP.\n\n" + VIP_TEXT,
+            reply_markup=vip_keyboard()
+        )
+        return
+    await message.answer(TRADING_TEXT)
+
+# =========================
 # CALLBACKS
-# =======================
-@dp.callback_query(F.data == "i_paid")
-async def i_paid_callback(callback: CallbackQuery):
-    set_waiting_proof(callback.from_user.id)
-    await callback.message.answer(
-        "✅ D’accord.\n\nEnvoie maintenant ta preuve de paiement.\n"
-        "Tu peux envoyer une photo ou un texte avec la référence."
-    )
+# =========================
+@dp.callback_query(F.data == "paid")
+async def paid_callback(callback: CallbackQuery):
+    cur.execute("INSERT OR REPLACE INTO waiting_proof(user_id) VALUES (?)", (callback.from_user.id,))
+    conn.commit()
+    await callback.message.answer("✅ Envoie maintenant ta preuve de paiement.\nTu peux envoyer une photo.")
     await callback.answer()
 
-# =======================
-# PAYMENT PROOF
-# =======================
-@dp.message(F.photo)
-async def photo_handler(message: Message):
-    save_user(message)
-
-    if not is_waiting_proof(message.from_user.id):
-        await message.answer("Photo reçue. Pour un paiement, clique d’abord sur 💎 Offre VIP puis ✅ J’ai payé.")
+@dp.callback_query(F.data.startswith("approve_"))
+async def approve_callback(callback: CallbackQuery, bot: Bot):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Non autorisé", show_alert=True)
         return
 
-    add_payment(message.from_user.id, "photo", "photo")
+    user_id = int(callback.data.split("_")[1])
+    activate_vip(user_id, 30)
+    await bot.send_message(user_id, "🎉 Ton accès VIP est activé pour 30 jours.")
+    await callback.answer("VIP activé")
+    await callback.message.answer(f"✅ VIP validé pour {user_id}")
 
-    caption = (
-        "💰 <b>Nouvelle preuve de paiement</b>\n\n"
-        f"Nom : {message.from_user.full_name}\n"
-        f"User ID : <code>{message.from_user.id}</code>\n"
-        f"Username : @{message.from_user.username or 'aucun'}\n\n"
-        f"Pour activer : <code>/vip {message.from_user.id} 30</code>"
-    )
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject_callback(callback: CallbackQuery, bot: Bot):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Non autorisé", show_alert=True)
+        return
 
-    await message.bot.send_photo(
+    user_id = int(callback.data.split("_")[1])
+    cur.execute("DELETE FROM waiting_proof WHERE user_id=?", (user_id,))
+    conn.commit()
+
+    await bot.send_message(user_id, "❌ Paiement refusé.")
+    await callback.answer("Paiement refusé")
+    await callback.message.answer(f"❌ Paiement refusé pour {user_id}")
+
+# =========================
+# PROOF PHOTO
+# =========================
+@dp.message(F.photo)
+async def proof_photo(message: Message, bot: Bot):
+    save_user(message)
+
+    if not waiting_proof(message.from_user.id):
+        await message.answer("Photo reçue.")
+        return
+
+    await bot.send_photo(
         ADMIN_ID,
         message.photo[-1].file_id,
-        caption=caption
+        caption=(
+            f"💰 <b>PREUVE DE PAIEMENT</b>\n\n"
+            f"User ID : <code>{message.from_user.id}</code>\n"
+            f"Nom : {message.from_user.full_name}"
+        ),
+        reply_markup=admin_proof_keyboard(message.from_user.id)
     )
 
-    await message.answer("✅ Preuve reçue. L’admin va vérifier.")
+    await message.answer("✅ Preuve envoyée à l’admin.")
 
-@dp.message(F.text)
-async def text_handler(message: Message):
+# =========================
+# FALLBACK
+# =========================
+@dp.message()
+async def fallback_handler(message: Message):
     save_user(message)
+    await message.answer("Utilise le menu ou une commande comme /start")
 
-    known = {"⚽ Pronostics foot", "📈 Signaux trading", "💎 Offre VIP", "👤 Mon compte"}
-    if message.text in known:
-        return
-
-    if message.text.startswith("/"):
-        return
-
-    if is_waiting_proof(message.from_user.id):
-        add_payment(message.from_user.id, message.text, "text")
-
-        await message.bot.send_message(
-            ADMIN_ID,
-            "💰 <b>Nouvelle référence paiement</b>\n\n"
-            f"Nom : {message.from_user.full_name}\n"
-            f"User ID : <code>{message.from_user.id}</code>\n"
-            f"Message : {message.text}\n\n"
-            f"Pour activer : <code>/vip {message.from_user.id} 30</code>"
-        )
-
-        await message.answer("✅ Référence reçue. L’admin va vérifier.")
-        return
-
-    await message.answer("Message reçu 👍 Utilise le menu.")
-
-# =======================
+# =========================
 # MAIN
-# =======================
+# =========================
 async def main():
-    print("Initialisation V7...", flush=True)
-    init_db()
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN manquant.")
+    if not FOOT_API_KEY:
+        raise ValueError("FOOT_API_KEY manquante.")
 
-    print("Connexion bot...", flush=True)
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
 
-    print("Bot V7 connecté. En attente des messages...", flush=True)
+    print("Bot V16 connecté. En attente des messages...", flush=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    threading.Thread(target=run_web, daemon=True).start()
     asyncio.run(main())
